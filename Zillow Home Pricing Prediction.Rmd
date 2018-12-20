@@ -1,0 +1,398 @@
+---
+title: "Zillow Home Pricing Prediction"
+author: "Brian Li"
+date: "2018/12/16"
+output: 
+  html_document: 
+    keep_md: yes
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Libraries
+```{r lib, message = FALSE, warning = FALSE}
+library(ZillowR)
+library(tidyverse)
+library(XML)
+library(xml2)
+library(parallel)
+library(caret)
+library(randomForest)
+library(microbenchmark)
+```
+
+## Data Preparation
+### Address Treatment
+```{r address, eval = FALSE}
+# Read the address CSV file downloaded from data.gov
+# https://catalog.data.gov/dataset/addresses-in-the-city-of-los-angeles/resource/e922beea-6b7a-46ab-a3fb-536dd3f6fdd5
+address <- read_csv("~/Documents/Github Repositories/Zillow House Pricing Prediction/Addresses_in_the_City_of_Los_Angeles.csv")
+
+# Concatenate it to the format the the zillow API accepts
+conc_address <- with(address, paste(HSE_NBR, HSE_DIR_CD, STR_NM, STR_SFX_CD))
+```
+
+### API Accounts Testing
+```{r testing, eval=FALSE}
+# Test API accounts with a workable address
+zillow_api_results <- GetDeepSearchResults(address = '14707 W SUNNY DR', citystatezip = "Los Angeles, CA", zws_id = "X1-ZWz1882lpo8kcr_728x4")
+zillow_api_results <- GetDeepSearchResults(address = '14707 W SUNNY DR', citystatezip = "Los Angeles, CA", zws_id = "X1-ZWz1883ha61fyj_6frtk")
+zillow_api_results <- GetDeepSearchResults(address = '14707 W SUNNY DR', citystatezip = "Los Angeles, CA", zws_id = "X1-ZWz1881y1avwnf_7j3qs")
+```
+
+### Define functions to extract data from the XML nodes of zillow API query
+```{r functions}
+# Since there is a limit of API queries each day
+# Define a function to determine the address subset that will be used each day (trial)
+seqSubset <- function(address, size = 3000, replace = FALSE) {
+  
+  # Create an empty list of call_trial to store the row number to subset for each trial
+  call_trial <- list()
+  # Create an empty list of address_subset to store the address subsets for each trial
+  address_subset <- list()
+  
+  # Define total length of master address vector
+  len <- length(address)
+  # Define a vector of row number
+  call_number_pool <- seq(1, len)
+  
+  # Determine number of iterations to get all data by dividing the size of query each trial
+  iterations <- len %/% size
+  
+  set.seed(68)
+  for (i in 1:iterations) {
+    call_trial[[i]] <- sample(call_number_pool, size = size, replace = replace) # Random sample row numbers using uniform dist from the overall pool
+    address_subset[[i]] <- address[call_trial[[i]]] # Slice the addresses corresponding to the subset of row numbers
+    call_number_pool <- call_number_pool[!call_number_pool %in% call_trial[[i]]] # Take away the row numbers done from the overall pool
+  }
+  
+  # Take care of the remainder rows
+  if (len %% size != 0) {
+    call_trial[[iterations+1]] <- call_number_pool
+    address_subset[[iterations+1]] <- address[call_trial[[iterations+1]]]
+  }
+  
+  # Create a list of 2 lists (trial containing the rows numbers of addresses, address containing address subsets queried in each API request)
+  subset <- list(trial = call_trial, address = address_subset)
+  return(subset)
+  
+}
+
+# Define a function to perform the API query going through all the addresses in the subset
+getResults <- function (address = NULL, citystatezip = "Los Angeles, CA", zws_id = NULL) {
+  list_of_results <- list()
+  
+  # Loop through the addresses with the zillow API query
+  # For loop is used since R Apply function family can't work with the API query. 
+  for (i in 1:length(address)){
+    list_of_results[[i]] <- GetDeepSearchResults(address = address[i], citystatezip = citystatezip, zws_id = zws_id)
+  }
+  
+  # Only grab the XML response in each query
+  responses <- lapply(list_of_results,`[[`, 'response')
+  
+  # Some queries are not successful because the addresses are incomplete or don't match zillow database.
+  # Create another lisst to filter only the successful queries. 
+  responses_notnull <- Filter(Negate(is.null), responses)
+  
+  query <- list(responses = responses, responses_notnull = responses_notnull)
+  return(query)
+  
+}
+
+# Define a function to extract information from combined responses and form a tibble
+zillow_tb_generator <- function(combined_responses){
+  
+  results <- lapply(combined_responses, getNodeSet, "//response/results/result")
+  
+  # Flatten list of results because some queries return more than 1 result
+  flatten_results <- unlist(results, recursive = FALSE)
+  
+  # Create empty columns
+  zipcode <- data.frame()
+  street_address_and_name <- data.frame()
+  city <- data.frame()
+  use_code <- data.frame()
+  tax_assessment_year <- data.frame()
+  tax_assessment_value <- data.frame()
+  year_built <- data.frame()
+  lot_size <- data.frame()
+  finished_square_feet <- data.frame()
+  bathrooms <- data.frame()
+  bedrooms <- data.frame()
+  zestimate_amount<- data.frame()
+  
+  # region name and type need to be grabbed differently, hence initiating null vectors
+  region_name <- NULL
+  region_type <- NULL
+  
+  for (i in 1:length(flatten_results)) {
+    
+    # Obtain information from specific node (e.g. street) using xpath and turn into dataframe 
+    street_address_and_name_new_row <- xmlToDataFrame(getNodeSet(flatten_results[[i]], "//result/address/street"))
+    
+    # If information is present in the node, the above new row will return at least 1 row.
+    if (nrow(street_address_and_name_new_row)>0) {
+      street_address_and_name <- rbind(street_address_and_name, street_address_and_name_new_row) # append the row to the column
+    } else {
+      street_address_and_name <- rbind(street_address_and_name, NA) # else append NA to indicate no info can be grabbed from the node.
+    }
+    
+    # Similarly
+    zipcode_new_row <- xmlToDataFrame(getNodeSet(flatten_results[[i]], "//result/address/zipcode"))
+    if (nrow(zipcode_new_row)>0) {
+      zipcode <- rbind(zipcode, zipcode_new_row)
+    } else {
+      zipcode <- rbind(zipcode, NA)
+    }
+    
+    city_new_row <- xmlToDataFrame(getNodeSet(flatten_results[[i]], "//result/address/city"))
+    if (nrow(city_new_row)>0) {
+      city <- rbind(city, city_new_row)
+    } else {
+      city <- rbind(city, NA)
+    }
+    
+    use_code_new_row <- xmlToDataFrame(getNodeSet(flatten_results[[i]], "//result/useCode"))
+    if (nrow(use_code_new_row)>0) {
+      use_code <- rbind(use_code, use_code_new_row)
+    } else {
+      use_code <- rbind(use_code, NA)
+    }
+    
+    tax_assessment_year_new_row <- xmlToDataFrame(getNodeSet(flatten_results[[i]], "//result/taxAssessmentYear"))
+    if (nrow(tax_assessment_year_new_row)>0) {
+      tax_assessment_year <- rbind(tax_assessment_year, tax_assessment_year_new_row)
+    } else {
+      tax_assessment_year <- rbind(tax_assessment_year, NA)
+    }
+    
+    tax_assessment_value_new_row <- xmlToDataFrame(getNodeSet(flatten_results[[i]], "//result/taxAssessment"))
+    if (nrow(tax_assessment_value_new_row)>0) {
+      tax_assessment_value <- rbind(tax_assessment_value, tax_assessment_value_new_row)
+    } else {
+      tax_assessment_value <- rbind(tax_assessment_value, NA)
+    }
+    
+    year_built_new_row <- xmlToDataFrame(getNodeSet(flatten_results[[i]], "//result/yearBuilt"))
+    if (nrow(year_built_new_row)>0) {
+      year_built <- rbind(year_built, year_built_new_row)
+    } else {
+      year_built <- rbind(year_built, NA)
+    }
+    
+    lot_size_new_row <- xmlToDataFrame(getNodeSet(flatten_results[[i]], "//result/lotSizeSqFt"))
+    if (nrow(lot_size_new_row)>0) {
+      lot_size <- rbind(lot_size, lot_size_new_row)
+    } else {
+      lot_size <- rbind(lot_size, NA)
+    }
+    
+    finished_square_feet_new_row <- xmlToDataFrame(getNodeSet(flatten_results[[i]], "//result/finishedSqFt"))
+    if (nrow(finished_square_feet_new_row)>0) {
+      finished_square_feet <- rbind(finished_square_feet, finished_square_feet_new_row)
+    } else {
+      finished_square_feet <- rbind(finished_square_feet, NA)
+    }
+    
+    bathrooms_new_row <- xmlToDataFrame(getNodeSet(flatten_results[[i]], "//result/bathrooms"))
+    if (nrow(bathrooms_new_row)>0) {
+      bathrooms <- rbind(bathrooms, bathrooms_new_row)
+    } else {
+      bathrooms <- rbind(bathrooms, NA)
+    }
+    
+    bedrooms_new_row <- xmlToDataFrame(getNodeSet(flatten_results[[i]], "//result/bedrooms"))
+    if (nrow(bedrooms_new_row)>0) {
+      bedrooms <- rbind(bedrooms, bedrooms_new_row)
+    } else {
+      bedrooms <- rbind(bedrooms, NA)
+    }
+    
+    # Zestime_amount is a special case because some nodes contain partial tags with no information
+    # getNodeSet function will return error if there is broken or partial tag, hence the need for tryCatch
+    zestimate_amount_new_row <- tryCatch(xmlToDataFrame(getNodeSet(flatten_results[[i]], "//result/zestimate/amount")), 
+                                         error = function (e) { data.frame() })
+    if (nrow(zestimate_amount_new_row)>0) {
+      zestimate_amount <- rbind(zestimate_amount, zestimate_amount_new_row)
+    } else {
+      zestimate_amount <- rbind(zestimate_amount, NA)
+    }
+    
+    # Region name and type come from node attributes, hence the need of xmlAttrs function
+    # Otherwise, concept is similar.
+    region_node <- getNodeSet(flatten_results[[i]], "//result/localRealEstate/region")
+    if (length(region_node) > 0) {
+      region_attributes <- xmlAttrs(region_node[[1]])
+      region_name[i] <- region_attributes['name']
+      region_type[i] <- region_attributes['type']
+    } else {
+      region_name[i] <- NA
+      region_type[i] <- NA
+    }
+    
+  }
+  
+  extracted_df <- data.frame(street_address_and_name, zipcode, city, use_code, tax_assessment_year, tax_assessment_value, 
+                             year_built, lot_size, finished_square_feet, bathrooms, bedrooms, zestimate_amount,
+                             region_name, region_type)
+  
+  # Assign column names as desired
+  colnames(extracted_df) <- c('street_address_and_name', 'zipcode', 'city', 'use_code', 'tax_assessment_year', 'tax_assessment_value', 'year_built', 'lot_size',
+                              'finished_square_feet', 'bathrooms', 'bedrooms', 'zestimate_amount', 'region_name', 'region_type')
+  
+  # Turn data frame into tb to facilitate use of tidyverse functions (optional)
+  extracted_tb <- tbl_df(extracted_df)
+  
+  # Turn certain columns into numeric by explicitly specifying their names
+  tidy_tb <- extracted_tb %>% mutate_at(vars('tax_assessment_year', 'tax_assessment_value', 'year_built', 'lot_size',
+                                             'finished_square_feet', 'bathrooms', 'bedrooms','zestimate_amount'),
+                                            funs(as.numeric(as.character(.))))
+  
+  return(tidy_tb)
+}
+
+```
+
+### Make API queries using the getResults function defined above
+```{r queries, eval = FALSE}
+# Determine the address subset used in each query assuming the upper limit of 5000 API calls.
+subset <- seqSubset(address = conc_address, size = 5000)
+
+# 1st trial (day 1)
+query1 <- getResults(address = subset$address[[1]], zws_id = "X1-ZWz1883ha61fyj_6frtk")
+# 2nd trial (day 1)
+query2 <- getResults(address = subset$address[[2]], zws_id = "X1-ZWz1882lpo8kcr_728x4")
+# 3rd trial (day 1)
+query3 <- getResults(address = subset$address[[3]], zws_id = "X1-ZWz1881y1avwnf_7j3qs")
+# 4th trial (day 2)
+query4 <- getResults(address = subset$address[[4]], zws_id = "X1-ZWz1883ha61fyj_6frtk")
+```
+
+### Extraction and cleaning
+```{r extraction, eval = FALSE}
+# Concatenate non null responses from query 1,2,3 and 4 into a single list
+combined_responses <- c(query1$responses_notnull, query2$responses_notnull, query3$responses_notnull, query4$responses_notnull)
+
+# Generate zillow tibble using the generator function
+zillow_tb <- zillow_tb_generator(combined_responses = combined_responses)
+
+# Write the tibble into CSV file
+write_csv(zillow_tb, "~/Documents/Github Repositories/Zillow House Pricing Prediction/zillow.csv")
+```
+
+## Analysis
+### Read csv and treat missing values
+```{r read}
+# Read data from the prepared csv
+zillow_tb_wchar <- read_csv("~/Documents/Github Repositories/Zillow House Pricing Prediction/zillow.csv")
+
+# Being aware of char columns
+# convert them to factor for tree fitting later
+zillow_tb <- zillow_tb_wchar %>% mutate_if(is.character, as.factor)
+
+# Remove missing values
+tb_wo_na <- zillow_tb %>% drop_na()
+
+# Number of rows after removing NAs
+nrow(tb_wo_na)
+
+# Create train index (80% data for training, 20% for testing)
+set.seed(68)
+intrain <- createDataPartition(tb_wo_na$zestimate_amount, p = 0.8, list = FALSE)
+
+# Split data into training and test set
+# Remove the first 3 columns
+tb_train <- tb_wo_na[intrain,] %>% select(c(-street_address_and_name, -zipcode, -city, -region_name))
+tb_test <- tb_wo_na[-intrain,] %>% select(c(-street_address_and_name, -zipcode, -city, -region_name))
+
+```
+
+### Sequential Bagged Tree
+```{r seq, cache = TRUE}
+# Conduct the random forest fitting with 1 core in 1 continuous process
+straight_fit_predict_time <- microbenchmark({
+  
+  # using mtry = number of predictor columns yields the special case of random forest (i.e. bagged tree)
+  seq_bag_fit <- randomForest(zestimate_amount ~ ., data = tb_train, mtry = ncol(tb_train)-1, ntree = 1500, importance =TRUE)
+  
+  # Predict zestimate amount using the bagged tree
+  seq_bag_predict <- predict(seq_bag_fit, newdata = select(tb_test,-zestimate_amount))
+  
+  # Calculate Test MSE
+  seq_bag_test_mse <- sqrt(sum((seq_bag_predict - tb_test$zestimate_amount)^2)/length(seq_bag_predict))
+  # alternative syntax
+  # seq_bag_test_mse <- sqrt(mean((seq_bag_predict - tb_test$zestimate_amount)^2))
+  
+}, times = 10, unit = "s")
+
+straight_fit_predict_time
+```
+
+### Sequential Bagged Tree Results
+```{r seq_result}
+# Importance plot
+varImpPlot(seq_bag_fit)
+
+# Show test mse
+seq_bag_test_mse
+```
+
+### Parallel Bagged Tree
+```{r parallel, cache = TRUE}
+
+# Determine number cores of computer
+# Leave 1 core for tasks other than R computation
+cores <- detectCores()
+cluster <- makeCluster(cores - 1)
+
+# Create parallel bagged tree fit function that can be applied to cluster later
+parallel.fit <- function(data, ntree) {
+    randomForest::randomForest(zestimate_amount ~ ., data = data, mtry = ncol(data)-1, ntree = ntree, importance =TRUE)
+  }
+
+# Conduct the random forest fitting with 3 cores in 3 parallel processes
+# each core will do 500 trees
+parallel_fit_predict_time <- microbenchmark({
+  
+  parallel_bag_fit <- parLapply(cluster, X = rep(500, cores-1), fun = parallel.fit, data = tb_train)
+  
+  newdata = select(tb_test,-zestimate_amount)
+  
+  # Predict zestimate amount using the parallel bagged tree from the 3 cores
+  parallel_bag_predict_1 <- predict(parallel_bag_fit[[1]], newdata = newdata)
+  parallel_bag_predict_2 <- predict(parallel_bag_fit[[2]], newdata = newdata)
+  parallel_bag_predict_3 <- predict(parallel_bag_fit[[3]], newdata = newdata)
+  
+  # Average the predictions
+  parallel_bag_predict <- (parallel_bag_predict_1 + parallel_bag_predict_2 + parallel_bag_predict_3)/3
+  
+  # Calculate Test MSE
+  parallel_bag_test_mse <- sqrt(sum((parallel_bag_predict - tb_test$zestimate_amount)^2)/length(parallel_bag_predict))
+  
+}, times = 10, unit = "s")
+
+parallel_fit_predict_time
+```
+
+### Parallel Bagged Tree Results
+```{r parallel_result}
+# Importance plot from the bagged tree of core 3 in the 10th benchmark trial
+varImpPlot(parallel_bag_fit[[3]])
+
+# Show test mse in the 10th benchmark trial
+parallel_bag_test_mse
+```
+
+### Prediction Results Output
+```{r}
+zillow_pred_results <- cbind(tb_wo_na[-intrain,], seq_bag_predict, parallel_bag_predict)
+
+# Write the tibble into CSV file
+write_csv(zillow_pred_results, "~/Documents/Github Repositories/Zillow House Pricing Prediction/zillow_prediction.csv")
+
+zillow_pred_results
+```
+
